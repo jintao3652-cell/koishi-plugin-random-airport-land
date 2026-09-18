@@ -1,0 +1,24 @@
+{
+  "name": "koishi-plugin-random-airport-land",
+  "description": "随机着陆机场",
+  "version": "0.0.1",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "dist"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin"
+  ],
+  "peerDependencies": {
+    "koishi": "^4.18.0"
+  },
+  "dependencies": {
+    "axios": "^1.20.0",
+    "xlsx": "^0.18.5"
+  }
+}
