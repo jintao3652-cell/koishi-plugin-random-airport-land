@@ -8,6 +8,21 @@ const TIMEOUT = 10000
 
 type Procedure = [string, string, unknown?]
 
+export interface RouteWaypoint {
+  name: string
+  lat: number
+  lon: number
+}
+
+export interface RouteResult {
+  ok: boolean
+  route: string
+  waypoints: RouteWaypoint[]
+  distanceNm?: number
+  cycle?: string
+  text: string[]
+}
+
 function json<T>(value: unknown): T | null {
   if (typeof value === 'object' && value !== null) return value as T
   try { return JSON.parse(String(value)) as T } catch { return null }
@@ -66,10 +81,8 @@ function formatRunways(items: RunwayWind[]): string {
 
 function formatProcedure(list: Procedure[], point: string, runways: RunwayWind[], kind: '离场' | '进场'): string {
   const runwaySet = new Set(runways.map(x => x.ident))
-  // list 已由 SID/STAR[point] 取得，数组中的 p[0] 是程序名而不是进离场点名。
   const matching = list
   if (!matching.length) return `\n依据当前风向推荐：\n无\n\n该${kind}点所有可用程序：\n无`
-  // 没有成功算出逆风跑道时，不得把 ALL 程序误标为“依据风向推荐”。
   const preferred = runways.length
     ? matching.filter(p => runwaySet.has(p[1]) || p[1] === 'ALL')
     : []
@@ -78,32 +91,93 @@ function formatProcedure(list: Procedure[], point: string, runways: RunwayWind[]
   return `\n依据当前风向推荐：\n${preferred.length ? preferred.map(render).join('、') : unavailable}\n\n该${kind}点所有可用程序：\n${matching.map(render).join('、')}`
 }
 
-export async function getRoute(dep: string, arr: string): Promise<string[]> {
+function toNumber(value: unknown): number | undefined {
+  const num = Number(value)
+  return Number.isFinite(num) && num !== 0 ? num : undefined
+}
+
+function resolveFix(fix: unknown): RouteWaypoint | null {
+  if (Array.isArray(fix)) {
+    const name = String(fix[0] ?? '').trim()
+    const lat = toNumber(fix[1])
+    const lon = toNumber(fix[2])
+    return name && lat !== undefined && lon !== undefined ? { name, lat, lon } : null
+  }
+  if (fix && typeof fix === 'object') {
+    const item = fix as Record<string, unknown>
+    const name = String(item.name ?? item.ident ?? item.id ?? '').trim()
+    const lat = toNumber(item.lat ?? item.latitude ?? item.latitudeDeg)
+    const lon = toNumber(item.lon ?? item.lng ?? item.longitude ?? item.longitudeDeg)
+    return name && lat !== undefined && lon !== undefined ? { name, lat, lon } : null
+  }
+  return null
+}
+
+function waypointsFromNodes(nodes: unknown): RouteWaypoint[] {
+  if (!Array.isArray(nodes)) return []
+  const result: RouteWaypoint[] = []
+  for (const node of nodes) {
+    const fix = resolveFix(node)
+    if (fix) result.push(fix)
+  }
+  return result
+}
+
+async function parseRoutePoints(route: string, dep: string, arr: string, cycle: string): Promise<RouteWaypoint[]> {
+  try {
+    const res = await axios.post(`${BASE}/efb/parseRoute`, null, {
+      params: { route, dep, arr, cycle },
+      timeout: TIMEOUT,
+    })
+    if (res.data?.code !== 20000) return []
+    const data = json<any>(res.data?.data)
+    if (!data) return []
+    return waypointsFromNodes(data.waypoints)
+  } catch (error) {
+    logger.debug(`parseRoute 不可用: ${axios.isAxiosError(error) ? error.response?.status : error}`)
+    return []
+  }
+}
+
+export async function getRoute(dep: string, arr: string): Promise<RouteResult> {
   dep = dep.toUpperCase(); arr = arr.toUpperCase()
   try {
     const cycleRes = await axios.get(`${BASE}/efb/getRouteCycle`, { timeout: TIMEOUT })
     const cycles = json<Array<string | number>>(cycleRes.data?.data) || []
     const cycle = Math.max(...cycles.map(Number).filter(Number.isFinite))
-    if (!Number.isFinite(cycle)) return ['无法获取导航数据周期']
+    if (!Number.isFinite(cycle)) {
+      return { ok: false, route: '', waypoints: [], text: ['无法获取导航数据周期'] }
+    }
 
     const [depMetar, arrMetar, depRunways, arrRunways] = await Promise.all([
       getMetar(dep), getMetar(arr), getRunways(dep), getRunways(arr),
     ])
     const res = await axios.post(`${BASE}/efb/route`, null, { params: { dep, arr, cycle }, timeout: TIMEOUT })
     const data = json<any>(res.data?.data)
-    if (res.data?.code !== 20000 || !data || data.error) return ['获取航路失败']
+    if (res.data?.code !== 20000 || !data || data.error) {
+      return { ok: false, route: '', waypoints: [], text: ['获取航路失败'] }
+    }
 
-    const tokens = String(data.route || '').trim().split(/\s+/)
+    const routeText = String(data.route || '').trim()
+    const tokens = routeText.split(/\s+/)
     const sidMarker = tokens.indexOf('SID')
     const starMarker = tokens.lastIndexOf('STAR')
     const sidPoint = sidMarker >= 0 ? tokens[sidMarker + 1] || '' : tokens[1] || ''
     const starPoint = starMarker > 0 ? tokens[starMarker - 1] || '' : tokens.at(-2) || ''
     const depRunway = recommendedRunways(depRunways, depMetar)
     const arrRunway = recommendedRunways(arrRunways, arrMetar)
-    return [
+
+    // 地图坐标首选 parseRoute（文档给出 lat/lon），失败时回落 route 接口的 nodeinformation
+    let waypoints = routeText ? await parseRoutePoints(routeText, dep, arr, String(cycle)) : []
+    if (!waypoints.length) waypoints = waypointsFromNodes(data.nodeinformation)
+
+    const distanceNm = toNumber(data.distance) ?? toNumber(data.distance_nm)
+    const usedCycle = data.data_version || String(cycle)
+
+    const text = [
       `完整航路: ${data.route || '无'}`,
-      `飞行距离: ${data.distance ?? '未知'} 海里`,
-      `导航数据周期: ${data.data_version || cycle}`,
+      `飞行距离: ${distanceNm ?? '未知'} 海里`,
+      `导航数据周期: ${usedCycle}`,
       `起飞机场 METAR: ${depMetar}`,
       `降落机场 METAR: ${arrMetar}`,
       `推荐起飞跑道: ${formatRunways(depRunway)}`,
@@ -111,8 +185,17 @@ export async function getRoute(dep: string, arr: string): Promise<string[]> {
       `推荐降落跑道: ${formatRunways(arrRunway)}`,
       `STAR: ${formatProcedure(procedures(data.STAR, starPoint), starPoint, arrRunway, '进场')}`,
     ]
+
+    return {
+      ok: true,
+      route: routeText,
+      waypoints,
+      distanceNm,
+      cycle: String(usedCycle),
+      text,
+    }
   } catch (error) {
     logger.error(`获取航路失败: ${error instanceof Error ? error.message : error}`)
-    return ['获取航路失败，请稍后再试']
+    return { ok: false, route: '', waypoints: [], text: ['获取航路失败，请稍后再试'] }
   }
 }

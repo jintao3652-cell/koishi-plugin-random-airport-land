@@ -1,31 +1,30 @@
-import { Context, Logger, h } from 'koishi';
+import { Context, Logger, Schema, h } from 'koishi';
 import {} from '@shangxueink/koishi-plugin-puppeteer-without-canvas';
-import { resolve } from 'path';
-import { readFileSync } from 'fs';
-import * as XLSX from 'xlsx';
-import { getRoute } from './route-search';
+import { Airport, loadAirports as loadAirportDatabase, loadInternationalAirports as loadInternationalDatabase } from './airport-data';
+import { RouteResult, getRoute } from './route-search';
+import { renderRouteMap } from './map-image';
 import { textToImage } from './txt-image';
 
 export const inject = ['puppeteer', 'canvas'];
 
-// 机场级别枚举
-enum AirportLevel {
-  FourC = '4C',
-  FourD = '4D',
-  FourE = '4E',
-  FourF = '4F',
-  ThreeC = '3C'
+export interface Config {
+  mapboxAccessToken: string;
 }
 
-// 机场数据结构
-interface Airport {
-  icao: string;
-  name: string;
-  iata: string;
-  lat: number;
-  lon: number;
-  level?: AirportLevel;
-}
+export const Config: Schema<Config> = Schema.object({
+  mapboxAccessToken: Schema.string().role('secret').default('').description('Mapbox access token（留空则只生成文字图片）'),
+});
+
+// 机场级别（与 airport-data 的 AirportLevel 保持一致，保留 Object.values 用法）
+const AirportLevel = {
+  ThreeC: '3C',
+  FourC: '4C',
+  FourD: '4D',
+  FourE: '4E',
+  FourF: '4F',
+} as const
+
+type AirportLevel = typeof AirportLevel[keyof typeof AirportLevel]
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -35,114 +34,18 @@ function getErrorStack(error: unknown): string {
   return error instanceof Error && error.stack ? error.stack : String(error);
 }
 
-const randomAirportsland = (ctx: Context) => {
+const randomAirportsland = (ctx: Context, config: Config) => {
   const logger = new Logger('random-airports-land');
   let airports: Airport[] = [];
   let internationalAirports: Airport[] = [];
   const airportLevels = new Map<AirportLevel, Airport[]>();
 
-  // 修复后的坐标解析函数
-  function parseCoordinate(coordinate: string): number {
-    if (!coordinate || coordinate.length < 2) {
-      throw new Error(`无效坐标格式: ${coordinate}`);
-    }
-    
-    const hemisphere = coordinate[0];
-    const numPart = coordinate.slice(1);
-    const isLongitude = numPart.length === 7; // 经度为7位，纬度为6位
-    
-    let degrees, minutes, seconds;
-    
-    try {
-      if (isLongitude) {
-        // 经度格式: E1204400 (3位度+2位分+2位秒)
-        degrees = parseInt(numPart.substring(0, 3));
-        minutes = parseInt(numPart.substring(3, 5));
-        seconds = parseInt(numPart.substring(5, 7));
-      } else {
-        // 纬度格式: N302200 (2位度+2位分+2位秒)
-        degrees = parseInt(numPart.substring(0, 2));
-        minutes = parseInt(numPart.substring(2, 4));
-        seconds = parseInt(numPart.substring(4, 6));
-      }
-    } catch (e) {
-      throw new Error(`坐标解析失败: ${coordinate} - ${getErrorMessage(e)}`);
-    }
-    
-    if (isNaN(degrees) || isNaN(minutes) || isNaN(seconds)) {
-      throw new Error(`坐标包含非数字: ${coordinate}`);
-    }
-    
-    // 转换为十进制度
-    const decimal = degrees + minutes / 60 + seconds / 3600;
-    return (hemisphere === 'S' || hemisphere === 'W') ? -decimal : decimal;
-  }
-
-  // 加载机场数据（带错误处理）
+  // 加载机场数据（AD_HP.csv + RWY.csv 推导等级）
   function loadAirports(): Airport[] {
     try {
-      logger.info('开始加载机场数据...');
-      const filePath = resolve(__dirname, 'airports.xlsx');
-      logger.debug(`Excel文件路径: ${filePath}`);
-      
-      const workbook = XLSX.readFile(filePath);
-      const sheetNames = workbook.SheetNames;
-      logger.debug(`工作表名称: ${sheetNames.join(', ')}`);
-      
-      const sheet = workbook.Sheets[sheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json<Record<string, any>>(sheet);
-      
-      if (!rows.length) {
-        throw new Error('Excel文件为空或无数据');
-      }
-      
-      logger.info(`成功读取 ${rows.length} 行数据`);
-      
-      const loadedAirports: Airport[] = [];
-      let successCount = 0;
-      let errorCount = 0;
-
-      for (const row of rows) {
-        try {
-          const icao = row.CODE_ID?.toString().trim();
-          if (!icao) {
-            logger.warn('跳过无ICAO代码的行');
-            continue;
-          }
-
-          const rawLat = row['GEO_LAT_ACCURACY']?.toString().trim();
-          const rawLon = row['GEO_LONG_ACCURACY']?.toString().trim();
-          
-          if (!rawLat || !rawLon) {
-            logger.warn(`跳过 ${icao} - 缺少经纬度数据`);
-            continue;
-          }
-
-          const rawLevel = (row.level?.toString().trim().toUpperCase() || '4C') as AirportLevel;
-          const level = Object.values(AirportLevel).includes(rawLevel) ? rawLevel : AirportLevel.FourC;
-
-          const airport: Airport = {
-            icao,
-            name: row.TXT_NAME?.toString().trim() || '未知机场',
-            iata: row.CODE_IATA?.toString().trim() || '',
-            lat: parseCoordinate(rawLat),
-            lon: parseCoordinate(rawLon),
-            level
-          };
-
-          if (rawLevel !== level) {
-            logger.warn(`机场 ${icao} 有无效级别: ${rawLevel}`);
-          }
-
-          loadedAirports.push(airport);
-          successCount++;
-        } catch (e) {
-          logger.warn(`行数据解析失败: ${getErrorMessage(e)}`);
-          errorCount++;
-        }
-      }
-      
-      logger.info(`机场数据加载完成: 成功 ${successCount}, 失败 ${errorCount}`);
+      logger.info('开始加载机场数据（AD_HP.csv）...');
+      const loadedAirports = loadAirportDatabase({ onWarn: (message) => logger.warn(message) });
+      logger.info(`机场数据加载完成: 成功 ${loadedAirports.length}`);
       return loadedAirports;
     } catch (error) {
       logger.error('机场数据加载失败:');
@@ -153,29 +56,7 @@ const randomAirportsland = (ctx: Context) => {
 
   function loadInternationalAirports(): Airport[] {
     try {
-      const filePath = resolve(__dirname, '..', 'Airports.json');
-      const raw = readFileSync(filePath, 'utf8');
-      const rows = JSON.parse(raw) as Array<Record<string, any>>;
-
-      const loadedAirports = rows
-        .map((row) => {
-          const icao = row.ICAO?.toString().trim().toUpperCase();
-          const lat = Number(row.Latitude);
-          const lon = Number(row.Longitude);
-          // 国际随机池同时允许国外机场，以及国内/港澳的 Z*、VR* 机场
-          if (!icao || icao.length !== 4 || /\d/.test(icao)) return null;
-          if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-
-          return {
-            icao,
-            name: row.Name?.toString().trim() || icao,
-            iata: row.PrimaryID?.toString().trim().toUpperCase() || '',
-            lat,
-            lon,
-          } satisfies Airport;
-        })
-        .filter(Boolean) as Airport[];
-
+      const loadedAirports = loadInternationalDatabase();
       logger.info(`国际机场数据加载完成: ${loadedAirports.length}`);
       return loadedAirports;
     } catch (error) {
@@ -207,6 +88,33 @@ const randomAirportsland = (ctx: Context) => {
       logger.warn(`结果图片生成失败，回退为文本: ${getErrorMessage(error)}`);
       return output;
     }
+  }
+
+  async function renderMission(
+    dep: Airport,
+    arr: Airport,
+    distance: number,
+    route: RouteResult,
+    outputLines: string[],
+  ) {
+    if (config.mapboxAccessToken) {
+      try {
+        const image = await renderRouteMap(ctx, {
+          dep: { icao: dep.icao, name: dep.name, lat: dep.lat, lon: dep.lon },
+          arr: { icao: arr.icao, name: arr.name, lat: arr.lat, lon: arr.lon },
+          waypoints: route.waypoints,
+          routeText: route.route,
+          distanceNm: route.distanceNm ?? distance,
+          cycle: route.cycle,
+          token: config.mapboxAccessToken,
+          title: '飞行任务航路图',
+        })
+        if (image) return h.image(image, 'image/png');
+      } catch (error) {
+        logger.warn(`航路地图生成失败，回退文字图: ${getErrorMessage(error)}`);
+      }
+    }
+    return await renderOutput(outputLines.join('\n'));
   }
 
   // 计算大圆距离（精确版）
@@ -448,7 +356,7 @@ const randomAirportsland = (ctx: Context) => {
         // 获取航路
         logger.info(`获取航路: ${dep.icao} -> ${arr.icao}`);
         const route = await getRoute(dep.icao, arr.icao);
-        logger.info(`航路点数量: ${route.length}`);
+        logger.info(`航路点数量: ${route.waypoints.length}`);
 
         // 格式化输出
         const outputLines = [
@@ -458,15 +366,14 @@ const randomAirportsland = (ctx: Context) => {
           `📏 飞行距离：${distance} 海里 (${(distance * 1.852).toFixed(1)} 公里)`,
           ...(maxDistance ? [`🔒 距离限制：≤ ${maxDistance} 海里`] : []),
           '🛣️ 推荐航路：',
-          ...(route.length > 0
-            ? route.map((point, i) => `${i + 1}. ${point.replace(/\n/g, '<br>')}`)
+          ...(route.text.length > 0
+            ? route.text.map((point, i) => `${i + 1}. ${point.replace(/\n/g, '<br>')}`)
             : ['⚠️ 无标准航路信息，建议自行规划']
           ),
         ];
 
-        const output = outputLines.join('\n');
         logger.info('生成结果输出...');
-        return await renderOutput(output);
+        return await renderMission(dep, arr, distance, route, outputLines);
       } catch (err) {
         logger.error(`指令执行失败：${getErrorMessage(err)}`);
         return [
@@ -592,13 +499,13 @@ const randomAirportsland = (ctx: Context) => {
           `飞行距离：${distance} 海里 (${(distance * 1.852).toFixed(1)} 公里)`,
           ...(maxDistance ? [`距离限制：≤ ${maxDistance} 海里`] : []),
           '推荐航路：',
-          ...(route.length > 0
-            ? route.map((point, i) => `${i + 1}. ${point.replace(/\n/g, '<br>')}`)
+          ...(route.text.length > 0
+            ? route.text.map((point, i) => `${i + 1}. ${point.replace(/\n/g, '<br>')}`)
             : ['无标准航路信息，建议自行规划']
           ),
         ];
 
-        return await renderOutput(outputLines.join('\n'));
+        return await renderMission(dep, arr, distance, route, outputLines);
       } catch (err) {
         logger.error(`随机国际落地指令执行失败：${getErrorMessage(err)}`);
         return [
@@ -678,7 +585,7 @@ const randomAirportsland = (ctx: Context) => {
         // 获取航路
         logger.info(`获取航路: ${dep.icao} -> ${arr.icao}`);
         const route = await getRoute(dep.icao, arr.icao);
-        logger.info(`航路点数量: ${route.length}`);
+        logger.info(`航路点数量: ${route.waypoints.length}`);
 
         // 格式化输出
         const outputLines = [
@@ -688,15 +595,14 @@ const randomAirportsland = (ctx: Context) => {
           `📏 飞行距离：${distance} 海里 (${(distance * 1.852).toFixed(1)} 公里)`,
           `🔤 级别设置：起飞=${depLevel}, 落地=${arrLevel === 'DEFAULT' ? '4D/4E/4F' : arrLevel}`,
           '🛣️ 推荐航路：',
-          ...(route.length > 0
-            ? route.map((point, i) => `${i + 1}. ${point.replace(/\n/g, '<br>')}`)
+          ...(route.text.length > 0
+            ? route.text.map((point, i) => `${i + 1}. ${point.replace(/\n/g, '<br>')}`)
             : ['⚠️ 无标准航路信息，建议自行规划']
           ),
         ];
 
-        const output = outputLines.join('\n');
         logger.info('生成结果输出...');
-        return await renderOutput(output);
+        return await renderMission(dep, arr, distance, route, outputLines);
       } catch (err) {
         logger.error(`随机等级指令执行失败：${getErrorMessage(err)}`);
         return [
